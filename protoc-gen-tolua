@@ -1,0 +1,155 @@
+#!/usr/bin/python
+
+import os
+from collections import defaultdict
+from StringIO import StringIO
+from lua_protobuf.generator import file_source, file_header, file_service, lua_protobuf_header, lua_protobuf_source
+from google.protobuf.descriptor import FieldDescriptor
+from google.protobuf.compiler.plugin_pb2 import CodeGeneratorRequest, CodeGeneratorResponse
+from sys import stdin, stdout, stderr
+
+serialized = stdin.read()
+request = CodeGeneratorRequest()
+request.ParseFromString(serialized)
+response = CodeGeneratorResponse()
+
+CPP_TYPES = {
+    FieldDescriptor.TYPE_DOUBLE: 'double',
+    FieldDescriptor.TYPE_FLOAT: 'float',
+    FieldDescriptor.TYPE_INT64: 'int64',
+    FieldDescriptor.TYPE_UINT64: 'unsigned int64',
+    FieldDescriptor.TYPE_INT32: 'int',
+    FieldDescriptor.TYPE_FIXED64: 'unsigned int64',
+    FieldDescriptor.TYPE_FIXED32: 'unsigned int',
+    FieldDescriptor.TYPE_BOOL: 'bool',
+    FieldDescriptor.TYPE_STRING: 'string',
+    FieldDescriptor.TYPE_UINT32: 'unsigned int',
+    FieldDescriptor.TYPE_SFIXED32: 'unsigned int',
+    FieldDescriptor.TYPE_SFIXED64: 'unsigned int64',
+    FieldDescriptor.TYPE_SINT32: 'int',
+    FieldDescriptor.TYPE_SINT64: 'int64',
+}
+
+keywords = ['static', 'class']
+def fieldname(s):
+    s = s.lower()
+    if s in keywords:
+        s = s+'_'
+    return s
+
+def typename(type_name, type):
+    if type_name:
+        parts = type_name.split('.', 2)
+        if len(parts)>2:
+            return parts[2].replace('.', '::')
+        else:
+            return '.'.join(parts).replace('.', '::')
+    else:
+        return CPP_TYPES[type]
+
+def write_field(fp, field_descriptor):
+    ftype = typename(field_descriptor.type_name, field_descriptor.type)
+    fname = fieldname(field_descriptor.name)
+    fnumber = field_descriptor.number
+    print >>fp, '''\
+  // required %(ftype)s %(fname)s = 1;
+  //static int kXFieldNumber = %(fnumber)s;
+  inline void clear_%(fname)s();'''%locals()
+    if field_descriptor.label in [FieldDescriptor.LABEL_OPTIONAL, FieldDescriptor.LABEL_REQUIRED]:
+        print >>fp, '  inline bool has_%(fname)s();'%locals()
+        if field_descriptor.type == FieldDescriptor.TYPE_MESSAGE:
+            print >>fp, '  %(ftype)s& %(fname)s();'%locals()
+        else:
+            print >>fp, '  tolua_property__proto %(ftype)s %(fname)s;'%locals()
+    if field_descriptor.label == FieldDescriptor.LABEL_REPEATED:
+        print >>fp, '  inline int %(fname)s_size();'%locals()
+        # indexing
+        print >>fp, '  inline %(ftype)s& %(fname)s(int index);'%locals()
+        # add
+        if field_descriptor.type == FieldDescriptor.TYPE_MESSAGE:
+            print >>fp, '  inline %(ftype)s* add_%(fname)s();'%locals()
+        else:
+            print >>fp, '  inline void add_%(fname)s(%(ftype)s);'%locals()
+    print >>fp, ''
+
+def write_message(fp, message_descriptor):
+    classname = message_descriptor.name
+    print >>fp,'''\
+class %(classname)s : public ::google::protobuf::MessageLite {
+  %(classname)s();
+  static %(classname)s& default_instance();
+  %(classname)s* New();
+  void CopyFrom(%(classname)s& from);
+  void MergeFrom(%(classname)s& from);
+  void Clear();
+  bool IsInitialized();
+  int ByteSize();
+  int GetCachedSize();
+  string GetTypeName();
+
+  bool SerializeToString(string* output);
+  bool ParseFromString(string& data);
+''' % locals()
+
+    for descriptor in message_descriptor.enum_type:
+        write_enum(fp, descriptor)
+
+    for field_descriptor in message_descriptor.field:
+        write_field(fp, field_descriptor)
+
+    print >>fp, '};'
+
+def write_enum(fp, descriptor):
+    print >>fp, 'enum %s {' % descriptor.name
+    for value in descriptor.value:
+        print >>fp, '%s=%d;'%(value.name, value.number)
+    print >>fp, '};'
+
+def pkg_file(file_descriptor):
+    basename = os.path.splitext(file_descriptor.name)[0]
+    filename = '%s.pb.pkg' % basename
+    package = file_descriptor.package
+    classname = 'Anim'
+    fp = StringIO()
+    print >>fp,'''$#include <%(basename)s.pb.h>
+$#include <string>
+$using namespace %(package)s;
+$using namespace std;
+'''%locals()
+
+    for descriptor in file_descriptor.enum_type:
+        write_enum(fp, descriptor)
+
+    for descriptor in file_descriptor.message_type:
+        write_message(fp, descriptor)
+
+    return filename, fp.getvalue()
+
+def package_file(package, files):
+    filename = '%s.pkg'%package
+    fp = StringIO()
+    print >>fp, 'module %s {'%package
+    for f in files:
+        basename = os.path.splitext(f.name)[0]
+        print >>fp, '    $pfile "%s.pb.pkg"' % basename
+    print >>fp, '}'
+    return filename, fp.getvalue()
+
+packages = defaultdict(list)
+
+for i in range(0, len(request.proto_file)):
+    file_descriptor = request.proto_file[i]
+    packages[file_descriptor.package].append(file_descriptor)
+    filename, filecontent = pkg_file(file_descriptor)
+
+    f = response.file.add()
+    f.name = filename
+    f.content = filecontent
+
+# write package files
+for package, files in packages.items():
+    f = response.file.add()
+    f.name, f.content = package_file(package, files)
+
+stdout.write(response.SerializeToString())
+exit(0)
